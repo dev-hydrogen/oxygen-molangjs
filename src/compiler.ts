@@ -2,12 +2,15 @@ import type { CallNode, Diagnostic, NameNode, Node, Program } from './ast';
 import { parse } from './parser';
 import {
 	BUILTIN_QUERIES,
+	STRUCT_QUERIES,
 	DEG,
 	EASINGS,
 	M,
 	MISSING,
 	MolangAbort,
 	SymbolTable,
+	clearSlot,
+	copyStruct,
 	missingValue,
 	readVarSlow,
 	type Env,
@@ -405,7 +408,8 @@ class CodeGen {
 			case 'Coalesce':
 				return this.coalesce(node);
 			case 'Assign':
-				return `(${this.assignExpr(node)}, 0)`;
+				// an assignment has the assigned value: v.a = (v.b = 3) sets both (t72 b4)
+				return `(${this.assignExpr(node)})`;
 			case 'Call':
 				if (node.callee.ns === 'math') return this.mathCall(node);
 				return this.callVal(node);
@@ -420,6 +424,12 @@ class CodeGen {
 
 	private binary(node: Extract<Node, { type: 'Binary' }>): string {
 		const { op } = node;
+		// a string literal in arithmetic or an ordering comparison is a load error in the game: "'Less Than '<''
+		// expression cannot take a 'String' argument. It only supports numerical arguments." (t73 s1, s2)
+		if (op !== '==' && op !== '!=' && (node.left.type === 'String' || node.right.type === 'String')) {
+			this.err(node, 'string-operand', `'${OP_NAMES[op] ?? op} ${op}' can't take a string: it only supports numbers`);
+			return '0';
+		}
 		if (op === '==' || op === '!=') {
 			const both = this.isNumeric(node.left) && this.isNumeric(node.right);
 			const a = both ? this.num(node.left) : this.val(node.left);
@@ -447,6 +457,10 @@ class CodeGen {
 
 	private coalesce(node: Extract<Node, { type: 'Coalesce' }>): string {
 		const left = node.left;
+		// the game logs this at load, but keeps the field, and ?? still catches a missing member (t67 m2–m4, m8)
+		if (hasMember(left)) {
+			this.err(left, 'member-coalesce', "found left-hand-side of ?? expression that isn't a direct-variable reference - this is unsupported at this time. The game logs this when it loads the effect, then runs it anyway", 'warning');
+		}
 		if (left.type === 'Name' && (left.ns === 'variable' || left.ns === 'temp' || left.ns === 'context')) {
 			const raw = this.readRaw(left)!;
 			const t = this.tmp();
@@ -462,15 +476,65 @@ class CodeGen {
 	}
 
 	private assignExpr(node: Extract<Node, { type: 'Assign' }>): string {
-		const value = this.isNumeric(node.value) ? this.num(node.value) : this.val(node.value);
 		const target = node.target;
-		if (target.ns === 'variable') {
-			const s = this.sym.variable(target.full);
-			return this.trace ? `TR(${node.id}, v[${s}] = ${value})` : `v[${s}] = ${value}`;
+		if (target.ns === 'temp' && target.path.includes('.')) {
+			// t67 m10: logged at load, but it runs
+			this.err(target, 'temp-member', 'left side of an assignment expression can only use temp variables if they are on their own and not part of a more complicated expression. The game logs this when it loads the effect, then runs it anyway', 'warning');
 		}
-		const s = this.sym.temp(target.full);
-		const t = this.tmp();
-		return `(${t} = ${value}, T.v[${s}] = ${t}, T.g[${s}] = T.gen${this.trace ? `, TR(${node.id}, ${t})` : ''})`;
+		const clear = this.clearParents(target);
+		const call = node.value.type === 'Call' && node.value.callee.ns === 'query' ? node.value : null;
+		const members = call ? STRUCT_QUERIES[call.callee.full] : undefined;
+		if (call && members) return withClear(clear, this.structAssign(node, call, members));
+		const value = this.isNumeric(node.value) ? this.num(node.value) : this.val(node.value);
+		const kind = target.ns === 'variable' ? 0 : 1;
+		const s = kind === 0 ? this.sym.variable(target.full) : this.sym.temp(target.full);
+		let assign: string;
+		if (kind === 0) assign = this.trace ? `TR(${node.id}, v[${s}] = ${value})` : `v[${s}] = ${value}`;
+		else {
+			const t = this.tmp();
+			assign = `(${t} = ${value}, T.v[${s}] = ${t}, T.g[${s}] = T.gen${this.trace ? `, TR(${node.id}, ${t})` : ''}, ${t})`;
+		}
+		// v.d = v.a where v.a is a struct: a copy of every member (t67 m5, t68 s4/s5)
+		const src = node.value;
+		if (src.type === 'Name' && (src.ns === 'variable' || src.ns === 'temp')) {
+			const raw = this.readRaw(src)!;
+			assign = `(${raw.code} === undefined && SC(E, ${raw.kind}, ${raw.slot}, ${kind}, ${s}) ? 0 : (${assign}))`;
+		}
+		return withClear(clear, assign);
+	}
+
+	/** Setting `v.a.b` replaces a number held by `v.a` (t68 s2): the names it's a member of are cleared first */
+	private clearParents(target: NameNode): string[] {
+		if (target.ns !== 'variable' && target.ns !== 'temp') return [];
+		const out: string[] = [];
+		const full = target.full;
+		for (let dot = full.indexOf('.', full.indexOf('.') + 1); dot !== -1; dot = full.indexOf('.', dot + 1)) {
+			const parent = full.slice(0, dot);
+			out.push(target.ns === 'variable' ? `CL(E, 0, ${this.sym.variable(parent)})` : `CL(E, 1, ${this.sym.temp(parent)})`);
+		}
+		return out;
+	}
+
+	/** `v.o = q.bone_origin('head')`: one query call per member of the struct, into `v.o.x`, `v.o.y`, … */
+	private structAssign(node: Extract<Node, { type: 'Assign' }>, call: CallNode, members: readonly string[]): string {
+		if (!this.knownQuery(call)) return '0';
+		const target = node.target;
+		const args = this.tmp();
+		const parts = [`${args} = ${call.args.length ? `[${call.args.map((a) => this.val(a)).join(', ')}]` : 'EA'}`];
+		// a member without a value reads 0: a bone query that finds no bone logs an error, fills the struct with zeros
+		// and the expression goes on (e17 b1, e20 b6, t80 b2); setting the members replaces a number held by its name
+		const own = target.ns === 'variable' ? `CL(E, 0, ${this.sym.variable(target.full)})` : `CL(E, 1, ${this.sym.temp(target.full)})`;
+		for (const m of members) {
+			const q = `QS(E, ${this.sym.query(`${call.callee.full}.${m}`)}, ${args}, ${call.id})`;
+			const name = `${target.full}.${m}`;
+			const t = this.tmp();
+			if (target.ns === 'variable') parts.push(`${t} = ${q}, ${own}, v[${this.sym.variable(name)}] = ${t} === undefined ? 0 : ${t}`);
+			else {
+				const s = this.sym.temp(name);
+				parts.push(`${t} = ${q}, ${own}, T.v[${s}] = ${t} === undefined ? 0 : ${t}, T.g[${s}] = T.gen`);
+			}
+		}
+		return `(${parts.join(', ')}${this.trace ? `, TR(${node.id}, 0)` : ''}, 0)`;
 	}
 
 	private mathCall(node: CallNode): string {
@@ -507,13 +571,24 @@ class CodeGen {
 					return `M.any(${node.args.map((a) => this.val(a)).join(', ')})`;
 			}
 		}
-		if (this.o.queryExists && !this.o.queryExists(full)) {
-			this.err(node, 'unknown-query', `Failed to resolve query ${full}.  Either the query does not exist or it is not supported in this context.`);
-			return '0';
-		}
+		if (!this.knownQuery(node)) return '0';
 		const id = this.sym.query(full);
 		const args = node.args.length ? `[${node.args.map((a) => this.val(a)).join(', ')}]` : 'EA';
+		// a struct query anywhere but on the right of an assignment is a load error in the game ("Add '+' expression
+		// cannot take a struct", e17 b2); assign it to a variable and read its members
+		if (STRUCT_QUERIES[full]) {
+			this.err(node, 'struct-query', `${full} returns a struct: assign it to a variable (v.o = ${node.callee.raw}(…);) and read its members (v.o.${STRUCT_QUERIES[full][0]})`);
+			return '0';
+		}
 		return `E.q(${id}, ${args}, ${node.id})`;
+	}
+
+	/** Unknown or unsupported queries are load errors, as in the game */
+	private knownQuery(node: CallNode): boolean {
+		const full = node.callee.full;
+		if (!this.o.queryExists || this.o.queryExists(full)) return true;
+		this.err(node, 'unknown-query', `Failed to resolve query ${full}.  Either the query does not exist or it is not supported in this context.`);
+		return false;
 	}
 
 	private iife(node: Node): string {
@@ -558,8 +633,9 @@ class CodeGen {
 				const body = this.stmt(node.body);
 				this.loopLabels.pop();
 				void savedDepth;
-				// Bedrock caps loops at 1024 iterations
-				return `${n} = Math.trunc(${count}); if (${n} > 1024) ${n} = 1024; ${label}: for (${i} = 0; ${i} < ${n}; ${i}++) { ${body} }`;
+				// a fractional count rounds up (2.4 and 2.5 run 3 times, 0.5 once); no cap: 200,000 iterations ran (t72, t78).
+				// A cap still guards against a runaway count freezing the editor.
+				return `${n} = Math.ceil(${count}); if (${n} > ${LOOP_GUARD}) ${n} = ${LOOP_GUARD}; ${label}: for (${i} = 0; ${i} < ${n}; ${i}++) { ${body} }`;
 			}
 			case 'ForEach':
 				if (this.o.context !== 'generic') this.err(node, 'not-available', 'for_each is not available in particle Molang');
@@ -614,13 +690,36 @@ function SOFTV(): never {
 	throw MISSING;
 }
 const EA: Value[] = Object.freeze([]) as unknown as Value[];
+/** Loops have no iteration cap in the game; this only stops a runaway count (NaN counts run 0 times) */
+const LOOP_GUARD = 1_000_000;
+/** A query that may have no value: the engine's soft dispatch when it has one */
+function QS(E: Env, id: number, args: Value[], node: number): Value | undefined {
+	return E.qs ? E.qs(id, args, node) : E.q(id, args, node);
+}
+const OP_NAMES: Record<string, string> = { '+': 'Add', '-': 'Subtract', '*': 'Multiply', '/': 'Divide', '<': 'Less Than', '<=': 'Less Than or Equal', '>': 'Greater Than', '>=': 'Greater Than or Equal' };
+
+/** `code`, with `clear` run first */
+function withClear(clear: string[], code: string): string {
+	return clear.length ? `(${clear.join(', ')}, ${code})` : code;
+}
+
+/** Does this expression read a member of a struct (`v.a.b`)? */
+function hasMember(node: Node): boolean {
+	if (node.type === 'Name') return (node.ns === 'variable' || node.ns === 'temp' || node.ns === 'context') && node.path.includes('.');
+	for (const value of Object.values(node)) {
+		if (Array.isArray(value)) {
+			for (const v of value) if (v && typeof v === 'object' && 'type' in v && hasMember(v as Node)) return true;
+		} else if (value && typeof value === 'object' && 'type' in value && hasMember(value as Node)) return true;
+	}
+	return false;
+}
 
 function buildFunction(js: string, step: boolean, f32: boolean) {
 	const factory = new Function(
-		'F', 'M', 'EZ', 'DEG', 'RV', 'MV', 'TN', 'DZ', 'SOFTN', 'SOFTV', 'MISSING', 'EA',
+		'F', 'M', 'EZ', 'DEG', 'RV', 'MV', 'TN', 'DZ', 'SOFTN', 'SOFTV', 'MISSING', 'EA', 'SC', 'CL', 'QS',
 		`"use strict"; return ${step ? 'function*' : 'function'} molang(E) { var v = E.v, T = E.t, TR = E.trace; ${js} };`,
 	);
-	return factory(f32 ? Math.fround : (x: number) => x, M, EASINGS, DEG, readVarSlow, missingValue, TN, DZ, SOFTN, SOFTV, MISSING, EA);
+	return factory(f32 ? Math.fround : (x: number) => x, M, EASINGS, DEG, readVarSlow, missingValue, TN, DZ, SOFTN, SOFTV, MISSING, EA, copyStruct, clearSlot, QS);
 }
 
 const ZERO_RUN = () => 0;

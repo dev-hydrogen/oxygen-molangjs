@@ -20,9 +20,11 @@ export {
 	EASINGS,
 	M as MolangMath,
 	BUILTIN_QUERIES,
+	STRUCT_QUERIES,
 	type Env,
 	type Value,
 	type QueryFn,
+	type SoftQueryFn,
 	type MolangErrorCode,
 } from './runtime';
 export {

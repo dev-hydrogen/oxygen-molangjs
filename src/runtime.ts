@@ -27,6 +27,12 @@ export class SymbolTable {
 	readonly contextNames: string[] = [];
 	readonly queries = new Map<string, number>();
 	readonly queryNames: string[] = [];
+	/**
+	 * Structs: a dotted name (`variable.a.b`) is a member of `variable.a`. By a struct's slot, the slots of every
+	 * name under it, at any depth (`variable.a` → `variable.a.b`, `variable.a.b.c`).
+	 */
+	readonly variableMembers = new Map<number, number[]>();
+	readonly tempMembers = new Map<number, number[]>();
 
 	private intern(map: Map<string, number>, names: string[], key: string): number {
 		let id = map.get(key);
@@ -37,12 +43,25 @@ export class SymbolTable {
 		}
 		return id;
 	}
+	private member(map: Map<string, number>, names: string[], members: Map<number, number[]>, key: string): number {
+		const known = map.get(key);
+		if (known !== undefined) return known;
+		const id = this.intern(map, names, key);
+		// `variable.a.b.c` is a member of `variable.a` and of `variable.a.b`
+		for (let dot = key.indexOf('.', key.indexOf('.') + 1); dot !== -1; dot = key.indexOf('.', dot + 1)) {
+			const parent = this.member(map, names, members, key.slice(0, dot));
+			let list = members.get(parent);
+			if (!list) members.set(parent, (list = []));
+			list.push(id);
+		}
+		return id;
+	}
 	/** `variable.foo` → slot */
 	variable(full: string): number {
-		return this.intern(this.variables, this.variableNames, full.toLowerCase());
+		return this.member(this.variables, this.variableNames, this.variableMembers, full.toLowerCase());
 	}
 	temp(full: string): number {
-		return this.intern(this.temps, this.tempNames, full.toLowerCase());
+		return this.member(this.temps, this.tempNames, this.tempMembers, full.toLowerCase());
 	}
 	context(full: string): number {
 		return this.intern(this.contexts, this.contextNames, full.toLowerCase());
@@ -89,6 +108,8 @@ export class MolangAbort extends Error {
 export const MISSING = Symbol('molang-missing');
 
 export type QueryFn = (id: number, args: Value[], node: number) => Value;
+/** A query that may have no value (undefined), for struct queries: their members are only set when there is one */
+export type SoftQueryFn = (id: number, args: Value[], node: number) => Value | undefined;
 
 /** Everything a compiled expression reads from. Engines create one per emitter and reuse it. */
 export interface Env {
@@ -111,6 +132,10 @@ export interface Env {
 	unsetMode: 'zero' | 'abort';
 	/** Optional resolver consulted before an unset read errors (kind 0 = variable, 1 = temp, 2 = context) */
 	lookup?: ((kind: 0 | 1 | 2, slot: number) => Value | undefined) | null;
+	/** Query dispatch that reports a query without a value as undefined (else `q` is used, which gives 0) */
+	qs?: SoftQueryFn | null;
+	/** The names behind the slots, for structs (reading one, copying one); without it a struct is just unset */
+	sym?: SymbolTable | null;
 }
 
 export function createEnv(partial: Partial<Env> = {}): Env {
@@ -131,9 +156,48 @@ export function createEnv(partial: Partial<Env> = {}): Env {
 
 // ---------- slow paths called from generated code (kept out of line so the fast path stays small)
 
+/** Does this unset slot hold a struct (any of its members set)? */
+export function hasMembers(E: Env, kind: 0 | 1 | 2, slot: number): boolean {
+	const s = E.sym;
+	if (!s || kind === 2) return false;
+	const list = (kind === 0 ? s.variableMembers : s.tempMembers).get(slot);
+	if (!list) return false;
+	for (const m of list) if ((kind === 0 ? E.v[m] : E.t.get(m)) !== undefined) return true;
+	return false;
+}
+
+/**
+ * `v.d = v.a` where v.a is a struct: every member is copied (a copy, not a reference: t68 s4/s5, t67 m5), and
+ * v.d's own number goes. False when there's no struct to copy.
+ */
+export function copyStruct(E: Env, from: 0 | 1 | 2, slot: number, to: 0 | 1 | 2, dst: number): boolean {
+	const s = E.sym;
+	if (!s || to === 2 || !hasMembers(E, from, slot)) return false;
+	const names = from === 0 ? s.variableNames : s.tempNames;
+	const base = names[slot];
+	const target = (to === 0 ? s.variableNames : s.tempNames)[dst];
+	for (const m of (from === 0 ? s.variableMembers : s.tempMembers).get(slot)!) {
+		const value = from === 0 ? E.v[m] : E.t.get(m);
+		if (value === undefined) continue;
+		const name = target + names[m].slice(base.length);
+		if (to === 0) E.v[s.variable(name)] = value;
+		else E.t.set(s.temp(name), value);
+	}
+	clearSlot(E, to, dst);
+	return true;
+}
+
+/** Unset a variable or temp: setting a member of a struct replaces a number held by its name (t68 s2) */
+export function clearSlot(E: Env, kind: 0 | 1 | 2, slot: number): void {
+	if (kind === 0) (E.v as (Value | undefined)[])[slot] = undefined;
+	else if (kind === 1) E.t.g[slot] = 0;
+}
+
 /** Numeric read of a variable slot that was undefined or a string */
 export function readVarSlow(E: Env, value: Value | undefined, kind: 0 | 1 | 2, slot: number, node: number): number {
 	if (value === undefined && E.lookup) value = E.lookup(kind, slot);
+	// a struct read as a number is 0, without an error (t67 m6, t68 s1)
+	if (value === undefined && hasMembers(E, kind, slot)) return 0;
 	if (value === undefined) {
 		const code: MolangErrorCode = kind === 0 ? 'unset-variable' : kind === 1 ? 'unset-temp' : 'unset-context';
 		E.err(code, node);
@@ -153,6 +217,7 @@ export function missingValue(E: Env, kind: 0 | 1 | 2, slot: number, node: number
 		const r = E.lookup(kind, slot);
 		if (r !== undefined) return r;
 	}
+	if (hasMembers(E, kind, slot)) return 0;
 	const code: MolangErrorCode = kind === 0 ? 'unset-variable' : kind === 1 ? 'unset-temp' : 'unset-context';
 	E.err(code, node);
 	if (E.unsetMode === 'abort') throw new MolangAbort(code, node);
@@ -300,6 +365,17 @@ export const M = {
 
 /** Built-in pure queries that Molang evaluates itself. */
 export const BUILTIN_QUERIES = new Set(['query.in_range', 'query.all', 'query.any', 'query.approx_eq']);
+
+/**
+ * Queries that return a struct, with its members. Assigned to a variable or temp (`v.o = q.bone_origin('head');`)
+ * they fill one entry per member (`v.o.x`, `v.o.y`, `v.o.z`); each member is asked of the query provider as its own
+ * name (`query.bone_origin.x`).
+ */
+export const STRUCT_QUERIES: Readonly<Record<string, readonly string[]>> = {
+	'query.bone_origin': ['x', 'y', 'z'],
+	'query.bone_rotation': ['x', 'y', 'z'],
+	'query.bone_aabb': ['min.x', 'min.y', 'min.z', 'max.x', 'max.y', 'max.z'],
+};
 
 /** Deterministic PRNG (mulberry32) — reproducible simulations / replays. */
 export function createRng(seed: number): () => number {

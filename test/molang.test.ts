@@ -154,6 +154,119 @@ describe('features', () => {
 	});
 });
 
+describe('struct queries', () => {
+	it('assigning one to a variable or temp asks for each member, once per member', () => {
+		const symbols = new SymbolTable();
+		const asked: string[] = [];
+		const env: Partial<Env> = {
+			q: (id, args) => {
+				const name = symbols.queryNames[id];
+				asked.push(`${name}(${args.join(', ')})`);
+				return name.endsWith('.y') ? 8 : name.endsWith('.max.z') ? 3 : 1;
+			},
+			t: new TempScope(),
+		};
+		const r = run("v.o = q.bone_origin('head'); t.b = q.bone_aabb('body'); return v.o.y + t.b.max.z;", { symbols, env });
+		expect(r.value).toBe(11);
+		expect(r.errors).toEqual([]);
+		expect(r.vars).toEqual({ 'variable.o.x': 1, 'variable.o.y': 8, 'variable.o.z': 1 });
+		expect(asked).toEqual([
+			'query.bone_origin.x(head)',
+			'query.bone_origin.y(head)',
+			'query.bone_origin.z(head)',
+			'query.bone_aabb.min.x(body)',
+			'query.bone_aabb.min.y(body)',
+			'query.bone_aabb.min.z(body)',
+			'query.bone_aabb.max.x(body)',
+			'query.bone_aabb.max.y(body)',
+			'query.bone_aabb.max.z(body)',
+		]);
+	});
+	it('the struct itself is never set, only its members', () => {
+		const r = run("v.o = q.bone_rotation('arm'); v.r = v.o ?? -1;", { env: { q: () => 2 } });
+		expect(r.vars['variable.r']).toBe(-1);
+		expect(r.vars['variable.o.z']).toBe(2);
+	});
+	it('an unknown struct query is a load error like any other', () => {
+		const expr = compile("v.o = q.bone_origin('head');", { symbols: new SymbolTable(), queryExists: () => false });
+		expect(expr.ok).toBe(false);
+		expect(expr.diagnostics[0].message).toMatch(/^Failed to resolve query query.bone_origin/);
+	});
+	it('the analyzer counts the members as written, so reading them is not an unset read', () => {
+		const a = analyze(parse("v.o = q.bone_aabb('body'); return v.o.min.y;").program, { expectsValue: true });
+		expect(a.writes.map((w) => w.name)).toEqual(['variable.o.min.x', 'variable.o.min.y', 'variable.o.min.z', 'variable.o.max.x', 'variable.o.max.y', 'variable.o.max.z']);
+		expect([...a.readBeforeWrite]).toEqual([]);
+		expect(a.queries.map((q) => q.signature)).toEqual(["query.bone_aabb('body')"]);
+	});
+	it('anywhere but on the right of an assignment, it is a load error (e17 b2)', () => {
+		for (const src of ["v.x = q.bone_origin('head') + 1;", "return q.bone_aabb('a');", "v.x = q.bone_rotation('a') * 2;"]) {
+			const expr = compile(src, { symbols: new SymbolTable() });
+			expect(expr.ok, src).toBe(false);
+			expect(expr.diagnostics[0].code).toBe('struct-query');
+		}
+	});
+});
+
+describe('structs, as measured in-game (t67, t68)', () => {
+	/** run with the symbol table in the env, as engines do */
+	const go = (src: string, env: Partial<Env> = {}) => {
+		const symbols = new SymbolTable();
+		return run(src, { symbols, env: { sym: symbols, t: new TempScope(), ...env } });
+	};
+	it('a struct read as a number is 0, and reading it doesn’t stop the expression (t67 m6, t68 s1)', () => {
+		const r = go('v.a.b = 2; v.x = v.a + 0.3; v.ok = 1;');
+		expect(r.vars['variable.x']).toBeCloseTo(0.3);
+		expect(r.vars['variable.ok']).toBe(1);
+		expect(r.errors).toEqual([]);
+	});
+	it('setting a member replaces a number held by its struct, setting the number keeps the members (t68 s2, s3)', () => {
+		expect(go('v.a = 5; v.a.b = 2; return v.a;').value).toBe(0);
+		expect(go('v.a.b = 2; v.a = 5; return v.a.b;').value).toBe(2);
+		expect(go('v.a = 5; v.a.b.c = 2; return v.a;').value).toBe(0);
+	});
+	it('copying a struct copies every member, at any depth, as a copy (t67 m5, t68 s4, s5)', () => {
+		const r = go('v.a.b = 2; v.a.c.d = 3; v.x = v.a; v.a.b = 7;');
+		expect(r.vars['variable.x.b']).toBe(2);
+		expect(r.vars['variable.x.c.d']).toBe(3);
+		expect(r.vars['variable.a.b']).toBe(7);
+		expect(go('t.a.b = 4; v.x = t.a; return v.x.b;').value).toBe(4);
+	});
+	it('a number still copies as a number, and an unset name still stops the expression', () => {
+		expect(go('v.a = 3; v.x = v.a; return v.x;').value).toBe(3);
+		const r = go('v.x = v.nothing; v.ok = 1;');
+		expect(r.vars['variable.ok']).toBeUndefined();
+		expect(r.errors).toEqual(['unset-variable']);
+	});
+	it('reading a missing member stops the expression; ?? catches it (t67 m9, m2)', () => {
+		expect(go('v.r = v.q.b; v.ok = 1;').vars['variable.ok']).toBeUndefined();
+		expect(go('v.a.b = 1; return v.a.c ?? 5;').value).toBe(5);
+		expect(go('return (v.z.b + 1) ?? 7;').value).toBe(7);
+	});
+	it('?? on a member and a temp member are what the game logs at load, as warnings: it runs them (t67)', () => {
+		const coalesce = compile('v.a.b ?? 5', { symbols: new SymbolTable() });
+		expect(coalesce.ok).toBe(true);
+		expect(coalesce.diagnostics.map((d) => [d.severity, d.code])).toEqual([['warning', 'member-coalesce']]);
+		expect(compile('(v.unset_w + 1) ?? 0.3', { symbols: new SymbolTable() }).diagnostics).toEqual([]);
+		const temp = compile('t.a.b = 2;', { symbols: new SymbolTable() });
+		expect(temp.ok).toBe(true);
+		expect(temp.diagnostics.map((d) => [d.severity, d.code])).toEqual([['warning', 'temp-member']]);
+	});
+	it('a struct query without a value fills the struct with zeros and goes on (e17 b1, e20 b6, t80 b2)', () => {
+		const symbols = new SymbolTable();
+		const env: Partial<Env> = { sym: symbols, qs: () => undefined, q: () => 0 };
+		const assigned = run("v.o = 5; v.o = q.bone_origin('root'); v.ok = 1;", { symbols, env });
+		expect(assigned.vars).toEqual({ 'variable.o.x': 0, 'variable.o.y': 0, 'variable.o.z': 0, 'variable.ok': 1 });
+	});
+	it("a string in arithmetic or an ordering comparison is a load error; == and != compare (t73)", () => {
+		for (const src of ["'a' < 'b'", "'a' + 'b'", "v.x - 'a'", "'a' >= 1"]) {
+			const expr = compile(src, { symbols: new SymbolTable() });
+			expect(expr.ok, src).toBe(false);
+			expect(expr.diagnostics[0].code).toBe('string-operand');
+		}
+		expect(compile("'a' == 'a' && v.s != 'b'", { symbols: new SymbolTable() }).ok).toBe(true);
+	});
+});
+
 function run2(src: string, o: { engine?: string; version?: number }) {
 	return evaluate(compile(src, { symbols: new SymbolTable(), ...o, f32: false }), createEnv());
 }
@@ -205,8 +318,12 @@ describe('loops', () => {
 	it('continue skips (docs example = 6)', () => {
 		expect(run('v.x = 0; loop(10, { (v.x > 5) ? continue; v.x = v.x + 1; }); return v.x;').value).toBe(6);
 	});
-	it('caps at 1024 iterations', () => {
-		expect(run('v.c = 0; loop(5000, { v.c = v.c + 1; }); return v.c;').value).toBe(1024);
+	it('has no 1024 cap, and rounds a fractional count up (t72, t78)', () => {
+		expect(run('v.c = 0; loop(200000, { v.c = v.c + 1; }); return v.c;').value).toBe(200000);
+		expect(run('v.c = 0; loop(2.4, { v.c = v.c + 1; }); return v.c;').value).toBe(3);
+		expect(run('v.c = 0; loop(2.5, { v.c = v.c + 1; }); return v.c;').value).toBe(3);
+		expect(run('v.c = 0; loop(0.5, { v.c = v.c + 1; }); return v.c;').value).toBe(1);
+		expect(run('v.c = 0; loop(-3, { v.c = v.c + 1; }); return v.c;').value).toBe(0);
 	});
 	it('return inside a loop returns from the expression', () => {
 		expect(run('v.i = 0; loop(10, { v.i = v.i + 1; (v.i == 3) ? return v.i * 10; }); return -1;').value).toBe(30);

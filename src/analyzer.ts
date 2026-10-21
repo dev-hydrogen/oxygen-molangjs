@@ -1,4 +1,5 @@
 import type { CallNode, Diagnostic, NameNode, Node, Program } from './ast';
+import { STRUCT_QUERIES } from './runtime';
 
 export interface NameUse {
 	/** canonical lowercase name, e.g. `variable.foo` */
@@ -86,10 +87,15 @@ export function analyze(program: Program, options: AnalyzeOptions = {}): Analysi
 					diagnostics.push({ severity: 'error', code: 'not-available', message: `${node.ns}.* is not available in particle Molang`, start: node.start, end: node.end });
 				}
 				return;
-			case 'Assign':
+			case 'Assign': {
 				visit(node.value, conditional); // RHS evaluates first
-				use(writes, node.target, conditional, 'write');
+				const v = node.value;
+				const members = v.type === 'Call' && v.callee.ns === 'query' ? STRUCT_QUERIES[v.callee.full] : undefined;
+				// a struct query fills one entry per member (v.o.x, v.o.y, …), not v.o itself
+				if (members) for (const m of members) use(writes, { ...node.target, path: `${node.target.path}.${m}`, full: `${node.target.full}.${m}` }, conditional, 'write');
+				else use(writes, node.target, conditional, 'write');
 				return;
+			}
 			case 'Call':
 				visitCall(node, conditional);
 				return;
